@@ -77,20 +77,38 @@ class multiHeadAttention(torch.nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = torch.nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = torch.nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim=-1)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B,T,num_heads*head_size)
+        out = self.proj(out)  # (B,T,n_embd)
+        return out
     
 # 这是一个简单的前馈网络
 class FeedForward(torch.nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(n_embd, n_embd),
+            torch.nn.Linear(n_embd, 4 * n_embd),
             torch.nn.ReLU(),
+            torch.nn.Linear(4 * n_embd, n_embd),
         )
+
     def forward(self, x):
         return self.net(x)
+    
+# 这是一个简单的 Transformer 块，包含一个多头注意力层和一个前馈网络
+class Block(torch.nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = multiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+
+    def forward(self, x):
+        x = self.sa(x) + x  # 注意力层的输出加上输入（残差连接）
+        x = self.ffwd(x) + x # 前馈网络的输出加上输入（残差连接）
+        return x
 
 # 我们定义了一个简单的语言模型
 # 它使用一个嵌入层来将输入的字符索引映射到一个向量空间中。
@@ -103,6 +121,8 @@ class BigramLanguageModel(torch.nn.Module):
         # 这里相当于一个映射表，输入是字符索引，输出是对应的嵌入向量
         self.token_embedding_table = torch.nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = torch.nn.Embedding(block_size, n_embd)
+        # 我们可以堆叠多个 Transformer 块来增加模型的表达能力
+        self.blocks = torch.nn.Sequential(*[Block(n_embd, 4) for _ in range(2)])
         # 这也可以看成一个映射，内部其实是一个线性层
         # sa: self-attention
         # lm: language model
@@ -120,8 +140,8 @@ class BigramLanguageModel(torch.nn.Module):
         pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (block_size, n_embd)
         # 将 token 嵌入和位置嵌入相加，得到输入到注意力头的张量
         x = tok_emb + pos_emb  # (batch_size, block_size, n_embd)
-        x = self.sa_head(x)  # (batch_size, block_size, n_embd)
-        x = self.ffwd(x)  # (batch_size, block_size, n_embd)
+        x = self.blocks(x)  # (batch_size, block_size, n_embd)
+        # x = self.ffwd(x)  # (batch_size, block_size, n_embd)
         logits = self.lm_head(x)  # (batch_size, block_size, vocab_size)
 
         if targets is None:
@@ -187,5 +207,5 @@ for steps in range(10000):
         print(f"step {steps}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
 
 content = torch.zeros((1,1), dtype=torch.long, device=device)
-string_trained = model.generate(content, max_new_tokens=100)
+string_trained = model.generate(content, max_new_tokens=500)
 print(decode(string_trained[0].tolist()))
