@@ -37,7 +37,6 @@ n = int(0.9*len(data))  # first 90% will be train, rest val
 train_data = data[:n]
 val_data = data[n:]
 
-# 
 torch.manual_seed(9977)
 
 def get_batch(split):
@@ -48,45 +47,96 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
-# 这是一个简单的注意力头
-class Head(torch.nn.Module):
-    def __init__(self, head_size):
-        # 每个 token 对应一个 embedding 向量
-        # 将其作为输入，用三个线性层来计算 Q, K, V
-        super().__init__()
-        self.key = torch.nn.Linear(n_embd, head_size, bias=False)
-        self.query = torch.nn.Linear(n_embd, head_size, bias=False)
-        self.value = torch.nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-        self.dropout = torch.nn.Dropout(dropout)
+# # 这是一个简单的注意力头
+# class Head(torch.nn.Module):
+#     def __init__(self, head_size):
+#         # 每个 token 对应一个 embedding 向量
+#         # 将其作为输入，用三个线性层来计算 Q, K, V
+#         super().__init__()
+#         self.key = torch.nn.Linear(n_embd, head_size, bias=False)
+#         self.query = torch.nn.Linear(n_embd, head_size, bias=False)
+#         self.value = torch.nn.Linear(n_embd, head_size, bias=False)
+#         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+#         self.dropout = torch.nn.Dropout(dropout)
 
-    def forward(self, x):
-        # 计算 Q, K, V
-        B,T,C = x.shape
-        k = self.key(x)   # (B,T,head_size)
-        q = self.query(x) # (B,T,head_size)
-        v = self.value(x) # (B,T,head_size)
+#     def forward(self, x):
+#         # 计算 Q, K, V
+#         B,T,C = x.shape
+#         k = self.key(x)   # (B,T,head_size)
+#         q = self.query(x) # (B,T,head_size)
+#         v = self.value(x) # (B,T,head_size)
 
-        # 计算注意力分数
-        wei = q @ k.transpose(-2,-1) * head_size**-0.5  # (B,T,head_size) @ (B,head_size,T) -> (B,T,T)
-        # 在训练过程中，我们需要确保模型只能访问当前时间步之前的上下文信息。
-        # 为此，我们使用一个下三角矩阵（tril）来屏蔽掉未来的信息。
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
-        wei = torch.nn.functional.softmax(wei, dim=-1)  # (B,T,T)
-        wei = self.dropout(wei)
+#         # 计算注意力分数
+#         wei = q @ k.transpose(-2,-1) * head_size**-0.5  # (B,T,head_size) @ (B,head_size,T) -> (B,T,T)
+#         # 在训练过程中，我们需要确保模型只能访问当前时间步之前的上下文信息。
+#         # 为此，我们使用一个下三角矩阵（tril）来屏蔽掉未来的信息。
+#         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
+#         wei = torch.nn.functional.softmax(wei, dim=-1)  # (B,T,T)
+#         wei = self.dropout(wei)
 
-        out = wei @ v  # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
-        return out
+#         out = wei @ v  # (B,T,T) @ (B,T,head_size) -> (B,T,head_size)
+#         return out
+
+# class multiHeadAttention(torch.nn.Module):
+#     def __init__(self, num_heads, head_size):
+#         super().__init__()
+#         self.heads = torch.nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+#         self.proj = torch.nn.Linear(n_embd, n_embd)
+
+#     def forward(self, x):
+#         out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B,T,num_heads*head_size)
+#         out = self.proj(out)  # (B,T,n_embd)
+#         return out
 
 class multiHeadAttention(torch.nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = torch.nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.num_heads = num_heads
+        self.head_size = head_size
+        
+        # 工业界做法：把 Q, K, V 合并成一个巨大的线性层！
+        # 输入 n_embd(384)，输出 3 * 384 = 1152
+        self.c_attn = torch.nn.Linear(n_embd, 3 * n_embd, bias=False)
         self.proj = torch.nn.Linear(n_embd, n_embd)
+        self.dropout = torch.nn.Dropout(dropout)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B,T,num_heads*head_size)
-        out = self.proj(out)  # (B,T,n_embd)
+        B, T, C = x.shape # C = n_embd = 384
+        
+        # 1. 一次性算出所有的 Q, K, V，速度起飞！
+        qkv = self.c_attn(x)
+        
+        # 2. 把结果劈成三份，每份是 (B, T, C)
+        q, k, v = qkv.split(C, dim=2)
+        
+        # 3. 维度魔法：把 C 拆成 (num_heads, head_size)
+        # 形状变为 (B, T, num_heads, head_size) -> 转置为 (B, num_heads, T, head_size)
+        # 转置是为了让同一个头的序列放在一起做矩阵乘法
+        k = k.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
+
+        # 4. 矩阵乘法计算 Attention (此时批量运算涵盖了 B 和 num_heads 两个维度)
+        # wei = (q @ k.transpose(-2, -1)) * (self.head_size ** -0.5) # (B, num_heads, T, T)
+        # wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        # wei = torch.nn.functional.softmax(wei, dim=-1)
+        # wei = self.dropout(wei)
+        # out = wei @ v # (B, num_heads, T, head_size)
+        
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=dropout if self.training else 0.0, 
+            is_causal=True
+        ) # (B, num_heads, T, head_size)
+
+
+        # 5. 把头拼接回来
+        # 转置回 (B, T, num_heads, head_size)，然后铺平为 (B, T, C)
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        
+        out = self.proj(out)
         return out
     
 # 这是一个简单的前馈网络
